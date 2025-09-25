@@ -1,7 +1,7 @@
 # STZ script
 ---
 
-This is the universal Bash script for full-cycle via "tar to ssh" with zstd:
+This is the universal Bash script for backup/restore procedure via "tar to ssh" with zstd:
 - backup (remote local .tar.zst)
 - list (view the contents of the archive as a tree)
 - test-restore (local sample decompression)
