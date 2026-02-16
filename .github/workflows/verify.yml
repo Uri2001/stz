@@ -13,20 +13,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y zstd pv shellcheck
+
       - name: Bash syntax check
         run: bash -n code/stz.sh
 
       - name: ShellCheck
         run: shellcheck code/stz.sh || true
 
-      - name: Make executable
-        run: chmod +x code/stz.sh
-
-      - name: Test --help
+      - name: Test --help (as first arg)
         run: bash code/stz.sh --help
 
-      - name: Test --version
+      - name: Test --version (as first arg)
         run: bash code/stz.sh --version
+
+      - name: Test --help (after command)
+        run: bash code/stz.sh backup --help
 
       - name: Test --dry-run backup
         run: |
@@ -38,12 +41,12 @@ jobs:
           bash code/stz.sh backup -H test@localhost -f test.tar.zst --dry-run --verbose etc/hostname 2>&1 | grep -q 'Remote command:'
           echo "verbose flag OK"
 
-      - name: Test ZSTD_LEVEL validation
+      - name: Test ZSTD_LEVEL validation (out of range)
         run: |
-          ! bash code/stz.sh backup --zstd-level 99 -H test@localhost etc 2>/dev/null
+          ! bash code/stz.sh backup --zstd-level 99 -H test@localhost etc/hostname 2>&1 | grep -q 'must be 1..22'
           echo "ZSTD_LEVEL validation OK"
 
-      - name: Test ZSTD_LEVEL non-numeric validation
+      - name: Test ZSTD_LEVEL validation (non-numeric)
         run: |
-          ! bash code/stz.sh backup --zstd-level abc -H test@localhost etc 2>/dev/null
+          ! bash code/stz.sh backup --zstd-level abc -H test@localhost etc/hostname 2>&1 | grep -q 'must be a number'
           echo "ZSTD_LEVEL non-numeric validation OK"

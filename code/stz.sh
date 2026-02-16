@@ -167,6 +167,12 @@ USAGE
 }
 
 # ---------- arg parsing ----------
+# Handle --help / --version before extracting MODE
+case "${1:-}" in
+  -h|--help)    print_help; exit 0;;
+  -V|--version) echo "$VERSION"; exit 0;;
+esac
+
 MODE="${1:-}"
 [[ -z "$MODE" ]] && { print_help; exit 1; }
 shift || true
