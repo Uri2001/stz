@@ -234,13 +234,16 @@ cmd_backup() {
     [[ "$ARCHIVE_FILE" = /* ]] || ARCHIVE_FILE="$OUT_DIR/$ARCHIVE_FILE"
   fi
 
-  log "Checking tar availability on remote..."
   local ssh_opts=()
   build_ssh_opts ssh_opts
-  local check_cmd
-  check_cmd="command -v $(shell_escape "$TAR_BIN") >/dev/null"
-  if ! "$SSH_BIN" "${ssh_opts[@]}" "$REMOTE_HOST" "$check_cmd"; then
-    die "tar not found on remote"
+
+  if (( ! DRY_RUN )); then
+    log "Checking tar availability on remote..."
+    local check_cmd
+    check_cmd="command -v $(shell_escape "$TAR_BIN") >/dev/null"
+    if ! "$SSH_BIN" "${ssh_opts[@]}" "$REMOTE_HOST" "$check_cmd"; then
+      die "tar not found on remote"
+    fi
   fi
 
   local -a tflags=()
@@ -366,17 +369,6 @@ cmd_restore() {
   local ssh_opts=()
   build_ssh_opts ssh_opts
 
-  log "Checking tar availability on remote..."
-  local check_cmd
-  check_cmd="command -v $(shell_escape "$TAR_BIN") >/dev/null"
-  "$SSH_BIN" "${ssh_opts[@]}" "$REMOTE_HOST" "$check_cmd" \
-    || die "tar not found on remote"
-
-  log "Creating prefix dir on remote: $RESTORE_PREFIX"
-  local mkdir_cmd
-  mkdir_cmd=$(shell_escape $SUDO_REMOTE mkdir -p -- "$RESTORE_PREFIX")
-  "$SSH_BIN" "${ssh_opts[@]}" "$REMOTE_HOST" "$mkdir_cmd"
-
   local -a tflags=()
   tar_feat_flags tflags
 
@@ -393,6 +385,17 @@ cmd_restore() {
     log "[dry-run] Would restore $ARCHIVE_FILE → $REMOTE_HOST:$RESTORE_PREFIX"
     return
   fi
+
+  log "Checking tar availability on remote..."
+  local check_cmd
+  check_cmd="command -v $(shell_escape "$TAR_BIN") >/dev/null"
+  "$SSH_BIN" "${ssh_opts[@]}" "$REMOTE_HOST" "$check_cmd" \
+    || die "tar not found on remote"
+
+  log "Creating prefix dir on remote: $RESTORE_PREFIX"
+  local mkdir_cmd
+  mkdir_cmd=$(shell_escape $SUDO_REMOTE mkdir -p -- "$RESTORE_PREFIX")
+  "$SSH_BIN" "${ssh_opts[@]}" "$REMOTE_HOST" "$mkdir_cmd"
 
   log "Restoring $ARCHIVE_FILE → $REMOTE_HOST:$RESTORE_PREFIX"
   pv_file_or_cat "$ARCHIVE_FILE" \
