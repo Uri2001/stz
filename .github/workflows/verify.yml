@@ -1,0 +1,46 @@
+name: Verify stz.sh
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Bash syntax check
+        run: bash -n code/stz.sh
+
+      - name: ShellCheck
+        run: shellcheck code/stz.sh || true
+
+      - name: Test --help
+        run: ./code/stz.sh --help
+
+      - name: Test --version
+        run: ./code/stz.sh --version
+
+      - name: Test --dry-run backup
+        run: |
+          ./code/stz.sh backup -H test@localhost -f test.tar.zst --dry-run etc/hostname 2>&1 | grep -q '\[dry-run\]'
+          echo "dry-run backup OK"
+
+      - name: Test --verbose flag
+        run: |
+          ./code/stz.sh backup -H test@localhost -f test.tar.zst --dry-run --verbose etc/hostname 2>&1 | grep -q 'Remote command:'
+          echo "verbose flag OK"
+
+      - name: Test ZSTD_LEVEL validation
+        run: |
+          ! ./code/stz.sh backup --zstd-level 99 -H test@localhost etc 2>/dev/null
+          echo "ZSTD_LEVEL validation OK"
+
+      - name: Test ZSTD_LEVEL non-numeric validation
+        run: |
+          ! ./code/stz.sh backup --zstd-level abc -H test@localhost etc 2>/dev/null
+          echo "ZSTD_LEVEL non-numeric validation OK"

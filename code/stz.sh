@@ -27,6 +27,9 @@ REMOTE_HOST=""            # user@host
 RESTORE_PREFIX="/"        # where to extract on remote (default "/")
 OUT_DIR="."               # where to write archives / test extractions locally
 
+DRY_RUN=0                 # 1=show commands without executing
+VERBOSE=0                 # 1=show full commands before execution
+
 EXCLUDES=()               # --exclude
 PATHS=()                  # paths relative to / (etc/nginx, var/www, ...)
 
@@ -44,12 +47,21 @@ cleanup_partial() {
   fi
   exit "$rc"
 }
-trap cleanup_partial ERR
+trap cleanup_partial EXIT
 
 require_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "Required command '$1' not found in PATH"
 }
 has_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+shell_escape() {
+  # Escape arguments for safe passing through SSH
+  local result=""
+  for arg in "$@"; do
+    result+="$(printf '%q ' "$arg")"
+  done
+  printf '%s' "$result"
+}
 
 build_ssh_opts() {
   local -n _arr=$1
@@ -58,6 +70,7 @@ build_ssh_opts() {
   [[ -n "$SSH_IDENTITY" ]] && _arr+=(-i "$SSH_IDENTITY")
   # Recommended options for script mode:
   _arr+=(-o BatchMode=yes -o StrictHostKeyChecking=accept-new)
+  _arr+=(-o ConnectTimeout=30 -o ServerAliveInterval=15 -o ServerAliveCountMax=3)
 }
 
 bytes_of() {
@@ -70,11 +83,11 @@ bytes_of() {
 }
 
 tar_feat_flags() {
-  # build --acls/--xattrs flags if enabled
-  local f=()
-  (( KEEP_ACLS   )) && f+=(--acls)
-  (( KEEP_XATTRS )) && f+=(--xattrs)
-  printf '%q ' "${f[@]}"
+  # build --acls/--xattrs flags if enabled; fills array by reference
+  local -n _tff=$1
+  _tff=()
+  (( KEEP_ACLS   )) && _tff+=(--acls)
+  (( KEEP_XATTRS )) && _tff+=(--xattrs)
 }
 
 pv_or_cat() {
@@ -112,6 +125,8 @@ Commands:
 General options:
   -h, --help                 show help
   -V, --version              print version
+  -v, --verbose              show full commands before execution
+  --dry-run                  show commands without executing
   --no-pv                    disable progress indicator
   --no-acls                  do not preserve ACLs (default: preserve)
   --no-xattrs                do not preserve xattrs (default: preserve)
@@ -160,6 +175,8 @@ while (( $# )); do
   case "$1" in
     -h|--help) print_help; exit 0;;
     -V|--version) echo "$VERSION"; exit 0;;
+    -v|--verbose) VERBOSE=1; shift;;
+    --dry-run) DRY_RUN=1; shift;;
     --no-pv) USE_PV=0; shift;;
     --no-acls) KEEP_ACLS=0; shift;;
     --no-xattrs) KEEP_XATTRS=0; shift;;
@@ -182,6 +199,11 @@ while (( $# )); do
       PATHS+=("$1"); shift;;
   esac
 done
+
+# ---------- parameter validation ----------
+[[ "$ZSTD_LEVEL" =~ ^[0-9]+$ ]] || die "--zstd-level must be a number (got '$ZSTD_LEVEL')"
+(( ZSTD_LEVEL >= 1 && ZSTD_LEVEL <= 22 )) || die "--zstd-level must be 1..22 (got $ZSTD_LEVEL)"
+[[ "$ZSTD_THREADS" =~ ^[0-9]+$ ]] || die "--threads must be a non-negative number (got '$ZSTD_THREADS')"
 
 # ---------- environment checks ----------
 require_cmd "$SSH_BIN"
@@ -209,30 +231,47 @@ cmd_backup() {
   log "Checking tar availability on remote..."
   local ssh_opts=()
   build_ssh_opts ssh_opts
-  if ! "$SSH_BIN" "${ssh_opts[@]}" "$REMOTE_HOST" "command -v $TAR_BIN >/dev/null"; then
+  local check_cmd
+  check_cmd="command -v $(shell_escape "$TAR_BIN") >/dev/null"
+  if ! "$SSH_BIN" "${ssh_opts[@]}" "$REMOTE_HOST" "$check_cmd"; then
     die "tar not found on remote"
   fi
 
-  local tflags
-  tflags=$(tar_feat_flags)
+  local -a tflags=()
+  tar_feat_flags tflags
 
   log "Creating archive: $ARCHIVE_FILE"
   log "Sources (remote:/): ${PATHS[*]}"
   log "Excludes: ${EXCLUDES[*]:-(none)}"
 
-  # Remote tar command
-  local -a remote_cmd=()
-  remote_cmd+=($SUDO_REMOTE "$TAR_BIN" -C / -cpf -)
-  [[ -n "$tflags" ]] && remote_cmd+=($tflags)
-  for ex in "${EXCLUDES[@]}"; do remote_cmd+=(--exclude="$ex"); done
-  remote_cmd+=("${PATHS[@]}")
+  # Build escaped remote tar command
+  local -a remote_parts=()
+  remote_parts+=($SUDO_REMOTE)
+  remote_parts+=("$TAR_BIN" -C / -cpf -)
+  (( ${#tflags[@]} )) && remote_parts+=("${tflags[@]}")
+  for ex in "${EXCLUDES[@]}"; do remote_parts+=(--exclude="$ex"); done
+  remote_parts+=("${PATHS[@]}")
+  local remote_cmd_str
+  remote_cmd_str=$(shell_escape "${remote_parts[@]}")
+
+  local pipeline_desc="$SSH_BIN ${ssh_opts[*]} $REMOTE_HOST <remote_tar> | pv | $ZSTD_BIN -T$ZSTD_THREADS -$ZSTD_LEVEL -c > $ARCHIVE_FILE"
+  (( VERBOSE )) && log "Remote command: $remote_cmd_str"
+  (( VERBOSE )) && log "Pipeline: $pipeline_desc"
+
+  if (( DRY_RUN )); then
+    log "[dry-run] Would execute: $pipeline_desc"
+    return
+  fi
 
   # pipeline: ssh (tar stdout) | pv? | zstd > file
-  set -o pipefail
-  "$SSH_BIN" "${ssh_opts[@]}" "$REMOTE_HOST" "${remote_cmd[@]}" \
+  "$SSH_BIN" "${ssh_opts[@]}" "$REMOTE_HOST" "$remote_cmd_str" \
     | { (( USE_PV )) && has_cmd "$PV_BIN" && "$PV_BIN" || cat; } \
     | "$ZSTD_BIN" -T"$ZSTD_THREADS" -"$ZSTD_LEVEL" -c > "$ARCHIVE_FILE"
-  set +o pipefail
+
+  log "Verifying archive integrity..."
+  if ! "$ZSTD_BIN" -t "$ARCHIVE_FILE" 2>/dev/null; then
+    die "Archive verification failed: $ARCHIVE_FILE is corrupted"
+  fi
 
   log "Done: $ARCHIVE_FILE"
 }
@@ -244,7 +283,6 @@ print_tree_from_list() {
   function rtrim_slash(s){ sub(/\/$/,"",s); return s }
   { line=$0; gsub(/^\.\//,"",line); line=rtrim_slash(line); paths[++n]=line; }
   END{
-    PROCINFO["sorted_in"]="@ind_str_asc"
     for(i=1;i<=n;i++){
       p=paths[i]; if(p=="") continue;
       split(p, a, "/"); depth=length(a);
@@ -265,13 +303,11 @@ cmd_list() {
   [[ -n "$ARCHIVE_FILE" ]] || die "Need --file for list"
   [[ -f "$ARCHIVE_FILE" ]] || die "File not found: $ARCHIVE_FILE"
   log "Archive content (tree): $ARCHIVE_FILE"
-  set -o pipefail
   pv_file_or_cat "$ARCHIVE_FILE" \
     | "$ZSTD_BIN" -dc \
     | "$TAR_BIN" -tf - \
     | sort \
     | print_tree_from_list
-  set +o pipefail
 }
 
 cmd_test_restore() {
@@ -283,15 +319,36 @@ cmd_test_restore() {
     warn "You are not root. Restoring owners/permissions may fail. Use sudo."
   fi
 
-  local tflags
-  tflags=$(tar_feat_flags)
+  local -a tflags=()
+  tar_feat_flags tflags
+
+  # Check free space
+  if has_cmd df && has_cmd awk; then
+    local uncompressed_size avail_kb
+    uncompressed_size=$("$ZSTD_BIN" -l "$ARCHIVE_FILE" 2>/dev/null | awk 'NR==2{print $3}') || true
+    if [[ -n "${uncompressed_size:-}" && "$uncompressed_size" =~ ^[0-9]+$ ]]; then
+      avail_kb=$(df -k "$OUT_DIR" | awk 'NR==2{print $4}') || true
+      if [[ -n "${avail_kb:-}" && "$avail_kb" =~ ^[0-9]+$ ]]; then
+        local uncompressed_kb=$(( uncompressed_size / 1024 ))
+        if (( uncompressed_kb > avail_kb )); then
+          warn "Low disk space: archive uncompressed ~${uncompressed_kb}KB, available ~${avail_kb}KB in $OUT_DIR"
+        fi
+      fi
+    fi
+  fi
+
+  local extract_desc="$SUDO_LOCAL $TAR_BIN -C $OUT_DIR -xpf - --numeric-owner ${tflags[*]}"
+  (( VERBOSE )) && log "Extract command: $extract_desc"
+
+  if (( DRY_RUN )); then
+    log "[dry-run] Would extract $ARCHIVE_FILE into $OUT_DIR"
+    return
+  fi
 
   log "Test extraction into: $OUT_DIR"
-  set -o pipefail
   pv_file_or_cat "$ARCHIVE_FILE" \
     | "$ZSTD_BIN" -dc \
-    | $SUDO_LOCAL "$TAR_BIN" -C "$OUT_DIR" -xpf - --numeric-owner $tflags
-  set +o pipefail
+    | $SUDO_LOCAL "$TAR_BIN" -C "$OUT_DIR" -xpf - --numeric-owner "${tflags[@]}"
   log "Done."
 }
 
@@ -304,22 +361,37 @@ cmd_restore() {
   build_ssh_opts ssh_opts
 
   log "Checking tar availability on remote..."
-  "$SSH_BIN" "${ssh_opts[@]}" "$REMOTE_HOST" "command -v $TAR_BIN >/dev/null" \
+  local check_cmd
+  check_cmd="command -v $(shell_escape "$TAR_BIN") >/dev/null"
+  "$SSH_BIN" "${ssh_opts[@]}" "$REMOTE_HOST" "$check_cmd" \
     || die "tar not found on remote"
 
   log "Creating prefix dir on remote: $RESTORE_PREFIX"
-  "$SSH_BIN" "${ssh_opts[@]}" "$REMOTE_HOST" "$SUDO_REMOTE mkdir -p -- '$RESTORE_PREFIX'"
+  local mkdir_cmd
+  mkdir_cmd=$(shell_escape $SUDO_REMOTE mkdir -p -- "$RESTORE_PREFIX")
+  "$SSH_BIN" "${ssh_opts[@]}" "$REMOTE_HOST" "$mkdir_cmd"
 
-  local tflags
-  tflags=$(tar_feat_flags)
+  local -a tflags=()
+  tar_feat_flags tflags
+
+  local -a tar_parts=()
+  tar_parts+=($SUDO_REMOTE)
+  tar_parts+=("$TAR_BIN" -C "$RESTORE_PREFIX" -xpf - --numeric-owner)
+  (( ${#tflags[@]} )) && tar_parts+=("${tflags[@]}")
+  local tar_cmd_str
+  tar_cmd_str=$(shell_escape "${tar_parts[@]}")
+
+  (( VERBOSE )) && log "Remote tar command: $tar_cmd_str"
+
+  if (( DRY_RUN )); then
+    log "[dry-run] Would restore $ARCHIVE_FILE → $REMOTE_HOST:$RESTORE_PREFIX"
+    return
+  fi
 
   log "Restoring $ARCHIVE_FILE → $REMOTE_HOST:$RESTORE_PREFIX"
-  set -o pipefail
   pv_file_or_cat "$ARCHIVE_FILE" \
     | "$ZSTD_BIN" -dc \
-    | "$SSH_BIN" "${ssh_opts[@]}" "$REMOTE_HOST" \
-        "$SUDO_REMOTE $TAR_BIN -C '$RESTORE_PREFIX' -xpf - --numeric-owner $tflags"
-  set +o pipefail
+    | "$SSH_BIN" "${ssh_opts[@]}" "$REMOTE_HOST" "$tar_cmd_str"
   log "Done."
 }
 
